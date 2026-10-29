@@ -1,10 +1,12 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -24,13 +26,19 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 	defer l.Close()
 
-	// FirstIndex - should be zero
+	// FirstIndex - should be zero or one, depending on allow empty.
 	n, err := l.FirstIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 0 {
-		t.Fatalf("expected %d, got %d", 0, n)
+	if !l.opts.AllowEmpty {
+		if n != 0 {
+			t.Fatalf("expected %d, got %d", 0, n)
+		}
+	} else {
+		if n != 1 {
+			t.Fatalf("expected %d, got %d", 1, n)
+		}
 	}
 
 	// LastIndex - should be zero
@@ -286,7 +294,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 
 	// TruncateFront -- should fail, out of range
-	for _, i := range []int{0, N + 1} {
+	for _, i := range []int{0, N + 2} {
 		index := uint64(i)
 		if err = l.TruncateFront(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
@@ -331,7 +339,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 
 	// TruncateBack -- should fail, out of range
-	for _, i := range []int{0, 80} {
+	for _, i := range []int{0, 79} {
 		index := uint64(i)
 		if err = l.TruncateBack(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
@@ -415,9 +423,64 @@ func testLog(t *testing.T, opts *Options, N int) {
 
 	l.Sync()
 	testFirstLast(t, l, uint64(N-1), uint64(N), nil)
+
+	allowEmpty := opts != nil && opts.AllowEmpty
+	// TruncateFront -- truncate all entries
+
+	err = l.TruncateFront(uint64(N + 1))
+	if allowEmpty {
+		if err != nil {
+			t.Fatal(err)
+		}
+		testFirstLast(t, l, uint64(N+1), uint64(N), nil)
+	} else {
+		if err != ErrOutOfRange {
+			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
+		}
+	}
+
+	err = l.Write(uint64(N+1), []byte(dataStr(uint64(N+1))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	N++
+	if allowEmpty {
+		testFirstLast(t, l, uint64(N), uint64(N), nil)
+	} else {
+		testFirstLast(t, l, uint64(N-2), uint64(N), nil)
+	}
+
+	// TruncateBack -- truncate all entries
+	fidx, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowEmpty {
+		if fidx != uint64(N) {
+			t.Fatalf("expected %v, got %v", N, fidx)
+		}
+	} else {
+		if fidx != uint64(N-2) {
+			t.Fatalf("expected %v, got %v", N-2, fidx)
+		}
+	}
+
+	err = l.TruncateBack(uint64(fidx - 1))
+	if allowEmpty {
+		if err != nil {
+			t.Fatal(err)
+		}
+		testFirstLast(t, l, uint64(N), uint64(N-1), nil)
+	} else {
+		if err != ErrOutOfRange {
+			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
+		}
+	}
 }
 
-func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64, data func(index uint64) []byte) {
+func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64,
+	data func(index uint64) []byte,
+) {
 	t.Helper()
 	fi, err := l.FirstIndex()
 	if err != nil {
@@ -429,6 +492,19 @@ func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64, data fu
 	}
 	if fi != expectFirst || li != expectLast {
 		t.Fatalf("expected %v/%v, got %v/%v", expectFirst, expectLast, fi, li)
+	}
+	is, err := l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expectFirst > expectLast {
+		if !is {
+			t.Fatalf("expected true")
+		}
+	} else {
+		if is {
+			t.Fatalf("expected false")
+		}
 	}
 	for i := fi; i <= li; i++ {
 		dt1, err := l.Read(i)
@@ -450,16 +526,19 @@ func TestLog(t *testing.T) {
 	defer os.RemoveAll("testlog")
 
 	t.Run("nil-opts", func(t *testing.T) {
-		testLog(t, nil, 100)
+		testLog(t, nil, 500)
+	})
+	t.Run("allow-empty", func(t *testing.T) {
+		testLog(t, makeOpts(512, true, true), 500)
 	})
 	t.Run("no-sync", func(t *testing.T) {
 		t.Run("binary", func(t *testing.T) {
-			testLog(t, makeOpts(512, true), 100)
+			testLog(t, makeOpts(512, true, false), 100)
 		})
 	})
 	t.Run("sync", func(t *testing.T) {
 		t.Run("binary", func(t *testing.T) {
-			testLog(t, makeOpts(512, false), 100)
+			testLog(t, makeOpts(512, false, false), 100)
 		})
 	})
 }
@@ -511,7 +590,7 @@ func TestOutliers(t *testing.T) {
 
 	t.Run("fail-corrupted-tail-json", func(t *testing.T) {
 		defer os.RemoveAll("testlog/corrupt-tail")
-		opts := makeOpts(512, true)
+		opts := makeOpts(512, true, false)
 		optsRecoverTail := *opts
 		optsRecoverTail.RecoverCorruptedTail = true
 		os.MkdirAll("testlog/corrupt-tail", 0777)
@@ -563,7 +642,7 @@ func TestOutliers(t *testing.T) {
 
 	t.Run("start-marker-file", func(t *testing.T) {
 		lpath := "testlog/start-marker"
-		opts := makeOpts(512, true)
+		opts := makeOpts(512, true, false)
 		l := must(Open(lpath, opts)).(*Log)
 		defer l.Close()
 		for i := uint64(1); i <= 100; i++ {
@@ -577,45 +656,14 @@ func TestOutliers(t *testing.T) {
 		l = must(Open(lpath, opts)).(*Log)
 		defer l.Close()
 		testFirstLast(t, l, firstIndex, 100, nil)
-
 	})
-	// t.Run("end-marker-file", func(t *testing.T) {
-	// 	lpath := "testlog/end-marker"
-	// 	opts := makeOpts(512, true, JSON)
-	// 	l := must(Open(lpath, opts)).(*Log)
-	// 	defer l.Close()
-	// 	for i := uint64(1); i <= 100; i++ {
-	// 		must(nil, l.Write(i, []byte(dataStr(i))))
-	// 	}
-	// 	path := l.segments[l.findSegment(35)].path
-	// 	data := must(ioutil.ReadFile(path)).([]byte)
-	// 	var lastIndex uint64
-	// 	for {
-
-	// 		n, _, err := readEntry(rd, JSON, true)
-	// 		if err == io.EOF {
-	// 			break
-	// 		}
-	// 		if err != nil {
-	// 			t.Fatal(err)
-	// 		}
-	// 		lastIndex = n
-	// 	}
-
-	// 	must(nil, l.Close())
-	// 	data = must(ioutil.ReadFile(path)).([]byte)
-	// 	must(nil, ioutil.WriteFile(path+".END", data, 0666))
-	// 	l = must(Open(lpath, opts)).(*Log)
-	// 	defer l.Close()
-	// 	testFirstLast(t, l, 1, lastIndex)
-	// })
-
 }
 
-func makeOpts(segSize int, noSync bool) *Options {
+func makeOpts(segSize int, noSync bool, allowEmpty bool) *Options {
 	opts := *DefaultOptions
 	opts.SegmentSize = segSize
 	opts.NoSync = noSync
+	opts.AllowEmpty = allowEmpty
 	return &opts
 }
 
@@ -897,9 +945,420 @@ func TestConcurrency(t *testing.T) {
 	}
 }
 
+func TestRWConcurrency(t *testing.T) {
+	os.RemoveAll("testlog")
+
+	l, err := Open("testlog", &Options{
+		NoSync:     true,
+		NoCopy:     true,
+		AllowEmpty: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	notify := make(chan struct{}, 1)
+	count := 100
+
+	go func() {
+		defer wg.Done()
+		defer close(notify)
+		idx, _ := l.LastIndex()
+		for i := 0; i < count; i++ {
+			idx++
+			if err := l.Write(idx, []byte(dataStr(uint64(i)))); err != nil {
+				panic(err)
+			}
+			select {
+			case notify <- struct{}{}:
+			default:
+			}
+		}
+		if idx != uint64(count) {
+			panic(fmt.Sprintf("expected last index %d, got %d", count, idx))
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		idx, _ := l.FirstIndex()
+		for range notify {
+			for {
+				_, err := l.Read(idx)
+				if errors.Is(err, ErrNotFound) {
+					break
+				}
+				if err := l.TruncateFront(idx + 1); err != nil {
+					panic(err)
+				}
+				idx++
+			}
+		}
+		if idx != uint64(count+1) {
+			panic(fmt.Sprintf("expected first index %d, got %d", count+1, idx))
+		}
+	}()
+
+	wg.Wait()
+}
+
 func must(v interface{}, err error) interface{} {
 	if err != nil {
 		panic(err)
 	}
 	return v
+}
+
+func TestNoAllowEmpty(t *testing.T) {
+	os.RemoveAll("testlog")
+	l, err := Open("testlog", &Options{
+		NoSync:      true,
+		NoCopy:      true,
+		AllowEmpty:  false,
+		SegmentSize: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if l != nil {
+			l.Close()
+		}
+	}()
+	firstIndex, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastIndex, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIndex != 0 || lastIndex != 0 {
+		t.Fatalf("expected %d %d, got %d %d\n", 0, 0, firstIndex, lastIndex)
+	}
+	N := 1000
+	for i := 0; i < N; i++ {
+		err := l.Write(uint64(i)+1, []byte(fmt.Sprintf("%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = l.TruncateFront(uint64(N + 1))
+	if err != ErrOutOfRange {
+		t.Fatalf("expected %v, got %v\n", ErrOutOfRange, err)
+	}
+	err = l.TruncateBack(0)
+	if err != ErrOutOfRange {
+		t.Fatalf("expected %v, got %v\n", ErrOutOfRange, err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen, allowing empty
+	l, err = Open("testlog", &Options{
+		NoSync:      true,
+		NoCopy:      true,
+		AllowEmpty:  true,
+		SegmentSize: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = l.TruncateFront(uint64(N + 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen, not allowing empty
+	l, err = Open("testlog", &Options{
+		NoSync:      true,
+		NoCopy:      true,
+		AllowEmpty:  false,
+		SegmentSize: 4096,
+	})
+	if err != ErrEmptyLog {
+		t.Fatalf("expected %v, got %v", ErrEmptyLog, err)
+	}
+}
+
+func TestEmptyOpenFromNothing(t *testing.T) {
+	os.RemoveAll("testlog")
+	l, err := Open("testlog", &Options{
+		NoSync:     true,
+		NoCopy:     true,
+		AllowEmpty: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	isEmpty, err := l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isEmpty == false {
+		t.Fatal("expected true")
+	}
+	firstIndex, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastIndex, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIndex != 1 || lastIndex != 0 {
+		t.Fatalf("expected %d %d, got %d %d\n", 1, 0, firstIndex, lastIndex)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEmptyOpenFromExisting1(t *testing.T) {
+	os.RemoveAll("testlog")
+	os.Mkdir("testlog", 0777)
+	os.WriteFile("testlog/00000000000000000001", nil, 0666)
+	l, err := Open("testlog", &Options{
+		NoSync:     true,
+		NoCopy:     true,
+		AllowEmpty: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	isEmpty, err := l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isEmpty == false {
+		t.Fatal("expected true")
+	}
+	firstIndex, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastIndex, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIndex != 1 || lastIndex != 0 {
+		t.Fatalf("expected %d %d, got %d %d\n", 1, 0, firstIndex, lastIndex)
+	}
+}
+
+func TestEmptyOpenFromExisting1001(t *testing.T) {
+	os.RemoveAll("testlog")
+	os.Mkdir("testlog", 0777)
+	os.WriteFile("testlog/00000000000000001001", nil, 0666)
+	l, err := Open("testlog", &Options{
+		NoSync:     true,
+		NoCopy:     true,
+		AllowEmpty: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	isEmpty, err := l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isEmpty == false {
+		t.Fatal("expected true")
+	}
+	firstIndex, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastIndex, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIndex != 1001 || lastIndex != 1000 {
+		t.Fatalf("expected %d %d, got %d %d\n", 0, 0, firstIndex, lastIndex)
+	}
+}
+
+func TestEmptyTruncateFrontTwice(t *testing.T) {
+	os.RemoveAll("testlog")
+	l, err := Open("testlog", &Options{
+		NoSync:      true,
+		NoCopy:      true,
+		AllowEmpty:  true,
+		SegmentSize: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	N := 1000
+	for i := 0; i < N; i++ {
+		err := l.Write(uint64(i)+1, []byte(fmt.Sprintf("%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = l.TruncateFront(uint64(N) + 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty {
+		t.Fatalf("expected %v, got %v", true, empty)
+	}
+	index, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index != uint64(N+1) {
+		t.Fatalf("expected %v, got %v", uint64(N+1), index)
+	}
+	err = l.TruncateFront(uint64(N) + 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err = l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty {
+		t.Fatalf("expected %v, got %v", true, empty)
+	}
+	index, err = l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index != uint64(N+1) {
+		t.Fatalf("expected %v, got %v", uint64(N+1), index)
+	}
+}
+
+func TestEmptyTruncateBackTwice(t *testing.T) {
+	os.RemoveAll("testlog")
+	l, err := Open("testlog", &Options{
+		NoSync:      true,
+		NoCopy:      true,
+		AllowEmpty:  true,
+		SegmentSize: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	N := 1000
+	for i := 0; i < N; i++ {
+		err := l.Write(uint64(i)+1, []byte(fmt.Sprintf("%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = l.TruncateBack(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fidx, err := l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lidx, err := l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fidx != 1 || lidx != 0 {
+		t.Fatalf("expected %v/%v, got %v/%v", 1, 0, fidx, lidx)
+	}
+	empty, err := l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty {
+		t.Fatalf("expected %v, got %v", true, empty)
+	}
+	err = l.TruncateBack(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fidx, err = l.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lidx, err = l.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fidx != 1 || lidx != 0 {
+		t.Fatalf("expected %v/%v, got %v/%v", 1, 0, fidx, lidx)
+	}
+	empty, err = l.IsEmpty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty {
+		t.Fatalf("expected %v, got %v", true, empty)
+	}
+}
+
+func TestLenAllowEmpty(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+	l, err := Open("testlog", makeOpts(4096, true, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	expectLen := func(want uint64) {
+		t.Helper()
+		n, err := l.Len()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Fatalf("expected %d, got %d", want, n)
+		}
+	}
+	expectLen(0)
+	for i := uint64(1); i <= 10; i++ {
+		if err := l.Write(i, []byte(dataStr(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectLen(10)
+	if err := l.TruncateFront(4); err != nil {
+		t.Fatal(err)
+	}
+	expectLen(7)
+	if err := l.TruncateFront(11); err != nil {
+		t.Fatal(err)
+	}
+	expectLen(0)
+	if err := l.Write(11, []byte(dataStr(11))); err != nil {
+		t.Fatal(err)
+	}
+	expectLen(1)
+}
+
+func TestIssue33(t *testing.T) {
+	// Create a fresh log without allowempty, close, and reopen.
+	// This should not fail with an ErrEmptyLog
+	os.RemoveAll("testlog")
+	l, err := Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	l, err = Open("testlog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
 }

@@ -36,6 +36,11 @@ var (
 	// may be returned when the caller is attempting to remove *all* entries;
 	// The log requires that at least one entry exists following a truncate.
 	ErrOutOfRange = errors.New("out of range")
+
+	// ErrEmptyLog is returned by Open() when the `AllowEmpty` option was not
+	// provided and log has been emptied due to the use of TruncateFront() or
+	// TruncateBack().
+	ErrEmptyLog = errors.New("empty log")
 )
 
 // Options for Log
@@ -55,6 +60,19 @@ type Options struct {
 	// option is set, do not modify the returned data because it may affect
 	// other Read calls. Default false
 	NoCopy bool
+	// AllowEmpty allows for a log to have all entries removed through the use
+	// of TruncateFront() or TruncateBack(). Otherwise without this option,
+	// at least one entry must always remain following a truncate operation.
+	// Default false
+	//
+	// Warning: using this option changes the behavior of the log in the
+	// following ways:
+	// - An empty log will always have the FirstIndex() be equal to
+	//   LastIndex()+1.
+	// - For a newly created log that has no entries, FirstIndex() and
+	//   LastIndex() return 1 and 0, respectively.
+	//   Without AllowEmpty, both return 0.
+	AllowEmpty bool
 	// Perms represents the datafiles modes and permission bits
 	DirPerms  os.FileMode
 	FilePerms os.FileMode
@@ -70,6 +88,7 @@ var DefaultOptions = &Options{
 	SegmentSize:          16777216, // 16 MB log segment files.
 	SegmentCacheSize:     2,        // Number of cached in-memory segments
 	NoCopy:               false,    // Make a new copy of data for every Read call.
+	AllowEmpty:           false,    // Do not allow empty log. 1+ entries required
 	DirPerms:             0750,     // Permissions for the created directories
 	FilePerms:            0640,     // Permissions for the created data files
 	RecoverCorruptedTail: false,    // Don't recover corrupted tail.
@@ -196,7 +215,8 @@ func (l *Log) load() error {
 		})
 		l.firstIndex = 1
 		l.lastIndex = 0
-		l.sfile, err = os.OpenFile(l.segments[0].path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
+		l.sfile, err = os.OpenFile(l.segments[0].path,
+			os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		return err
 	}
 	// Open existing log. Clean up log if START of END segments exists.
@@ -260,6 +280,9 @@ func (l *Log) load() error {
 		return err
 	}
 	l.lastIndex = lseg.index + uint64(len(lseg.epos)) - 1
+	if l.lastIndex > 0 && l.firstIndex > l.lastIndex && !l.opts.AllowEmpty {
+		return ErrEmptyLog
+	}
 	return nil
 }
 
@@ -331,7 +354,8 @@ func (l *Log) cycle() error {
 		ebuf:  make([]byte, 0, 4096),
 	}
 	var err error
-	l.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
+	l.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC,
+		l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
@@ -464,16 +488,16 @@ func (l *Log) FirstIndex() (index uint64, err error) {
 	} else if l.closed {
 		return 0, ErrClosed
 	}
-	// We check the lastIndex for zero because the firstIndex is always one or
-	// more, even when there's no entries
-	if l.lastIndex == 0 {
+	if !l.opts.AllowEmpty && l.lastIndex == 0 {
 		return 0, nil
 	}
 	return l.firstIndex, nil
 }
 
-// LastIndex returns the index of the last entry in the log. Returns zero when
-// log has no entries.
+// LastIndex returns the index of the last entry in the log.
+// Returns zero when log has no entries.
+// When using the `AllowEmpty` option and when the log is empty, this will
+// return FirstIndex()-1, which is the last known deleted index.
 func (l *Log) LastIndex() (index uint64, err error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -482,7 +506,7 @@ func (l *Log) LastIndex() (index uint64, err error) {
 	} else if l.closed {
 		return 0, ErrClosed
 	}
-	if l.lastIndex == 0 {
+	if !l.opts.AllowEmpty && l.firstIndex == 0 {
 		return 0, nil
 	}
 	return l.lastIndex, nil
@@ -583,7 +607,7 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 	} else if l.closed {
 		return nil, ErrClosed
 	}
-	if index == 0 || index < l.firstIndex || index > l.lastIndex {
+	if index < l.firstIndex || index > l.lastIndex {
 		return nil, ErrNotFound
 	}
 	s, err := l.loadSegment(index)
@@ -621,6 +645,7 @@ func (l *Log) ClearCache() error {
 	l.clearCache()
 	return nil
 }
+
 func (l *Log) clearCache() {
 	l.scache.Range(func(_, v interface{}) bool {
 		s := v.(*segment)
@@ -633,8 +658,12 @@ func (l *Log) clearCache() {
 }
 
 // TruncateFront truncates the front of the log by removing all entries that
-// are before the provided `index`. In other words the entry at
-// `index` becomes the first entry in the log.
+// are before the provided `index`. In other words the entry at `index` becomes
+// the first entry in the log.
+//
+// The `AllowEmpty` option may be used to allow for removing all entries in the
+// log by providing `LastIndex+1` as the index. Otherwise without `AllowEmpty`,
+// at least one entry must always remain following a truncate.
 func (l *Log) TruncateFront(index uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -645,23 +674,35 @@ func (l *Log) TruncateFront(index uint64) error {
 	}
 	return l.truncateFront(index)
 }
+
 func (l *Log) truncateFront(index uint64) (err error) {
-	if index == 0 || l.lastIndex == 0 ||
-		index < l.firstIndex || index > l.lastIndex {
+	if index < l.firstIndex || index > l.lastIndex+1 {
+		return ErrOutOfRange
+	}
+	if !l.opts.AllowEmpty && index == l.lastIndex+1 {
 		return ErrOutOfRange
 	}
 	if index == l.firstIndex {
 		// nothing to truncate
 		return nil
 	}
-	segIdx := l.findSegment(index)
+	var segIdx int
 	var s *segment
-	s, err = l.loadSegment(index)
-	if err != nil {
-		return err
+	var ebuf []byte
+	if index == l.lastIndex+1 {
+		// Truncate all entries, only care about the last segment
+		segIdx = len(l.segments) - 1
+		s = l.segments[segIdx]
+		ebuf = nil
+	} else {
+		segIdx = l.findSegment(index)
+		s, err = l.loadSegment(index)
+		if err != nil {
+			return err
+		}
+		epos := s.epos[index-s.index:]
+		ebuf = s.ebuf[epos[0].pos:]
 	}
-	epos := s.epos[index-s.index:]
-	ebuf := s.ebuf[epos[0].pos:]
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	err = func() error {
@@ -694,6 +735,8 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
 			err = ErrCorrupt
+		}
+		if err != nil {
 			l.corrupt = true
 		}
 	}()
@@ -718,7 +761,8 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	s.index = index
 	if segIdx == len(l.segments)-1 {
 		// Reopen the tail segment file
-		if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
+		l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms)
+		if err != nil {
 			return err
 		}
 		var n int64
@@ -741,8 +785,12 @@ func (l *Log) truncateFront(index uint64) (err error) {
 }
 
 // TruncateBack truncates the back of the log by removing all entries that
-// are after the provided `index`. In other words the entry at `index`
-// becomes the last entry in the log.
+// are after the provided `index`. In other words the entry at `index` becomes
+// the last entry in the log.
+//
+// The `AllowEmpty` option may be used to allow for removing all entries in the
+// log by providing `FirstIndex()-1` as the index. Otherwise without
+// `AllowEmpty`, at least one entry must always remain following a truncate.
 func (l *Log) TruncateBack(index uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -755,22 +803,33 @@ func (l *Log) TruncateBack(index uint64) error {
 }
 
 func (l *Log) truncateBack(index uint64) (err error) {
-	if index == 0 || l.lastIndex == 0 ||
-		index < l.firstIndex || index > l.lastIndex {
+	if index < l.firstIndex-1 || index > l.lastIndex {
+		return ErrOutOfRange
+	}
+	if !l.opts.AllowEmpty && index == l.firstIndex-1 {
 		return ErrOutOfRange
 	}
 	if index == l.lastIndex {
 		// nothing to truncate
 		return nil
 	}
-	segIdx := l.findSegment(index)
+	var segIdx int
 	var s *segment
-	s, err = l.loadSegment(index)
-	if err != nil {
-		return err
+	var ebuf []byte
+	if index == l.firstIndex-1 {
+		// Truncate all entries, only care about the first segment
+		segIdx = 0
+		s = l.segments[segIdx]
+		ebuf = nil
+	} else {
+		segIdx = l.findSegment(index)
+		s, err = l.loadSegment(index)
+		if err != nil {
+			return err
+		}
+		epos := s.epos[:index-s.index+1]
+		ebuf = s.ebuf[:epos[len(epos)-1].end]
 	}
-	epos := s.epos[:index-s.index+1]
-	ebuf := s.ebuf[:epos[len(epos)-1].end]
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	err = func() error {
@@ -803,6 +862,8 @@ func (l *Log) truncateBack(index uint64) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
 			err = ErrCorrupt
+		}
+		if err != nil {
 			l.corrupt = true
 		}
 	}()
@@ -823,7 +884,8 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		return err
 	}
 	// Reopen the tail segment file
-	if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
+	l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms)
+	if err != nil {
 		return err
 	}
 	var n int64
@@ -856,4 +918,17 @@ func (l *Log) Sync() error {
 		return ErrClosed
 	}
 	return l.sfile.Sync()
+}
+
+// IsEmpty returns true if there are no entries in the log.
+func (l *Log) IsEmpty() (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return false, ErrCorrupt
+	} else if l.closed {
+		return false, ErrClosed
+	}
+	return (l.firstIndex == 0 && l.lastIndex == 0) ||
+		l.firstIndex > l.lastIndex, nil
 }
